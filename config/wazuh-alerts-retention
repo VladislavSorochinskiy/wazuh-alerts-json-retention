@@ -1,0 +1,3 @@
+# Number of complete 24-hour periods to retain rotated Wazuh alert files.
+# Allowed range: 1-3650.
+RETENTION_DAYS=7

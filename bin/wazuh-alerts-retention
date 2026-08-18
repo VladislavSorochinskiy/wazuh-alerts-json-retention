@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+readonly PROGRAM_NAME="${0##*/}"
+readonly VERSION='1.0.0'
+readonly ALERTS_ROOT="${ALERTS_ROOT:-/var/ossec/logs/alerts}"
+readonly RETENTION_DAYS="${RETENTION_DAYS:-7}"
+readonly RETENTION_LOCK_FILE="${RETENTION_LOCK_FILE:-/run/lock/wazuh-alerts-retention.lock}"
+readonly RELATIVE_FILE_REGEX='^[0-9]{4}/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/ossec-alerts-[0-9]{2}(-[0-9]{3})?\.(log|json)\.(gz|sum)$'
+
+usage() {
+    cat <<USAGE
+Usage: ${PROGRAM_NAME} --dry-run|--delete
+       ${PROGRAM_NAME} --help
+       ${PROGRAM_NAME} --version
+
+Modes:
+  --dry-run   Show files that match the retention policy without deleting them.
+  --delete    Delete files that match the retention policy.
+
+Environment:
+  RETENTION_DAYS      Retention period in complete 24-hour periods. Default: 7.
+  ALERTS_ROOT         Wazuh alerts directory. Default: /var/ossec/logs/alerts.
+  RETENTION_LOCK_FILE Lock file path. Default: /run/lock/wazuh-alerts-retention.lock.
+USAGE
+}
+
+human_size() {
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec-i --suffix=B "$1"
+    else
+        printf '%s bytes\n' "$1"
+    fi
+}
+
+if (($# != 1)); then
+    usage >&2
+    exit 2
+fi
+
+case "$1" in
+    --dry-run|--delete)
+        mode="$1"
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    --version)
+        printf '%s %s\n' "$PROGRAM_NAME" "$VERSION"
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || (( RETENTION_DAYS > 3650 )); then
+    printf 'ERROR: RETENTION_DAYS must be an integer from 1 to 3650; got: %q\n' \
+        "$RETENTION_DAYS" >&2
+    exit 2
+fi
+
+if [[ "$ALERTS_ROOT" != /* || "$ALERTS_ROOT" == '/' ]]; then
+    printf 'ERROR: ALERTS_ROOT must be an absolute directory other than /; got: %q\n' \
+        "$ALERTS_ROOT" >&2
+    exit 2
+fi
+
+if [[ ! -d "$ALERTS_ROOT" ]]; then
+    printf 'ERROR: directory does not exist: %s\n' "$ALERTS_ROOT" >&2
+    exit 1
+fi
+
+if [[ "$RETENTION_LOCK_FILE" != /* ]]; then
+    printf 'ERROR: RETENTION_LOCK_FILE must be an absolute path; got: %q\n' \
+        "$RETENTION_LOCK_FILE" >&2
+    exit 2
+fi
+
+for command_name in dirname find flock mktemp rm stat; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'ERROR: required command not found: %s\n' "$command_name" >&2
+        exit 1
+    fi
+done
+
+lock_directory="$(dirname -- "$RETENTION_LOCK_FILE")"
+if [[ ! -d "$lock_directory" ]]; then
+    printf 'ERROR: lock directory does not exist: %s\n' "$lock_directory" >&2
+    exit 1
+fi
+
+exec 9>"$RETENTION_LOCK_FILE"
+if ! flock -n 9; then
+    printf 'ERROR: another %s process is already running.\n' "$PROGRAM_NAME" >&2
+    exit 75
+fi
+
+readonly RETENTION_MINUTES=$((RETENTION_DAYS * 24 * 60))
+candidate_file="$(mktemp -t wazuh-alerts-retention.XXXXXX)"
+trap 'rm -f -- "$candidate_file"' EXIT
+
+# Safety boundaries:
+# - stay on the same filesystem;
+# - inspect only ALERTS_ROOT/year/month/file;
+# - consider regular files only;
+# - prefilter Wazuh-like names, then validate the full relative path.
+if ! find "$ALERTS_ROOT" \
+    -xdev \
+    -mindepth 3 -maxdepth 3 \
+    -type f \
+    -mmin "+${RETENTION_MINUTES}" \
+    -name 'ossec-alerts-*' \
+    -print0 > "$candidate_file"; then
+
+    printf 'ERROR: find failed while scanning %s\n' "$ALERTS_ROOT" >&2
+    exit 1
+fi
+
+matched_count=0
+matched_bytes=0
+deleted_count=0
+deleted_bytes=0
+failures=0
+
+while IFS= read -r -d '' file; do
+    case "$file" in
+        "$ALERTS_ROOT"/*)
+            relative_path="${file#"$ALERTS_ROOT"/}"
+            ;;
+        *)
+            printf 'SKIP: candidate is outside the configured root: %s\n' "$file" >&2
+            continue
+            ;;
+    esac
+
+    if [[ ! "$relative_path" =~ $RELATIVE_FILE_REGEX ]]; then
+        continue
+    fi
+
+    if ! size="$(stat -c '%s' -- "$file" 2>/dev/null)"; then
+        printf 'SKIP: file disappeared before processing: %s\n' "$file" >&2
+        continue
+    fi
+
+    matched_count=$((matched_count + 1))
+    matched_bytes=$((matched_bytes + size))
+
+    if [[ "$mode" == '--dry-run' ]]; then
+        printf 'WOULD_DELETE: %s (%s bytes)\n' "$file" "$size"
+        continue
+    fi
+
+    if rm -f -- "$file"; then
+        deleted_count=$((deleted_count + 1))
+        deleted_bytes=$((deleted_bytes + size))
+        printf 'DELETED: %s (%s bytes)\n' "$file" "$size"
+    else
+        failures=$((failures + 1))
+        printf 'ERROR: failed to delete: %s\n' "$file" >&2
+    fi
+done < "$candidate_file"
+
+if [[ "$mode" == '--dry-run' ]]; then
+    printf 'SUMMARY: would delete %d file(s), total %s; retention %d day(s).\n' \
+        "$matched_count" \
+        "$(human_size "$matched_bytes")" \
+        "$RETENTION_DAYS"
+else
+    printf 'SUMMARY: matched %d file(s); deleted %d file(s), total %s; failures %d; retention %d day(s).\n' \
+        "$matched_count" \
+        "$deleted_count" \
+        "$(human_size "$deleted_bytes")" \
+        "$failures" \
+        "$RETENTION_DAYS"
+fi
+
+(( failures == 0 ))

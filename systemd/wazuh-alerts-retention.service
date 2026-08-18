@@ -1,0 +1,41 @@
+[Unit]
+Description=Delete rotated Wazuh alert files older than the retention period
+ConditionPathIsDirectory=/var/ossec/logs/alerts
+RequiresMountsFor=/var/ossec/logs/alerts
+
+[Service]
+Type=oneshot
+
+EnvironmentFile=-/etc/default/wazuh-alerts-retention
+Environment=ALERTS_ROOT=/var/ossec/logs/alerts
+Environment=RETENTION_LOCK_FILE=/run/lock/wazuh-alerts-retention.lock
+ExecStart=/usr/local/sbin/wazuh-alerts-retention --delete
+
+User=root
+Group=root
+UMask=0077
+
+# Reduce the cleanup job's scheduling priority.
+Nice=10
+IOSchedulingClass=idle
+
+# Service hardening. Only the Wazuh alerts directory remains writable.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/ossec/logs/alerts /run/lock
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+TimeoutStartSec=1h

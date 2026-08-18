@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Wazuh alert-file retention daily
+
+[Timer]
+# Run after Wazuh's normal midnight log rotation.
+OnCalendar=*-*-* 03:15:00
+
+# Run the missed job after boot if the host was offline at the scheduled time.
+Persistent=true
+
+AccuracySec=1min
+Unit=wazuh-alerts-retention.service
+
+[Install]
+WantedBy=timers.target
